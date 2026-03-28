@@ -4,12 +4,11 @@ import psycopg2
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+from backup.db_backup import DELETION_THRESHOLD_DAYS
+
 load_dotenv()
 
 POSTGRES_URL = os.getenv("POSTGRES_URL")
-
-# 3ヶ月前より古いデータを削除対象
-DELETION_THRESHOLD_DAYS = 90
 
 
 def get_todos_older_than(conn, days=DELETION_THRESHOLD_DAYS):

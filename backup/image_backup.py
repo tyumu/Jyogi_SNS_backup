@@ -6,6 +6,8 @@ from pathlib import Path
 import boto3
 from dotenv import load_dotenv
 
+from infra_logging import log_infra
+
 load_dotenv()
 
 R2_ENDPOINT = os.getenv("R2_TEMP_ENDPOINT")
@@ -69,6 +71,13 @@ def iter_image_records(sqlite_path, min_id_exclusive: int = 0):
             try:
                 todo_id_int = int(todo_id)
             except (TypeError, ValueError):
+                log_infra(
+                    source="image_backup.iter_image_records",
+                    log_level="warn",
+                    event_type="image_backup_invalid_todo_id",
+                    message="非数値の todo_id がスキップされました",
+                    detail={"raw_todo_id": todo_id, "url": url},
+                )
                 # 数値に変換できない id はスキップ
                 continue
 
@@ -76,6 +85,17 @@ def iter_image_records(sqlite_path, min_id_exclusive: int = 0):
             try:
                 dt = datetime.fromisoformat(str(created_at))
             except Exception:
+                log_infra(
+                    source="image_backup.iter_image_records",
+                    log_level="warn",
+                    event_type="image_backup_invalid_created_at",
+                    message="created_at のフォーマット不明のためスキップされました",
+                    detail={
+                        "raw_created_at": created_at,
+                        "todo_id": todo_id,
+                        "url": url,
+                    },
+                )
                 # フォーマット不明な場合はスキップ
                 continue
             month_key = dt.strftime("%Y%m")  # 例: 202603
@@ -133,6 +153,21 @@ def download_and_zip_images_by_month(sqlite_path):
                         print(f"  ✓ downloaded {filename} from R2")
                     except Exception as e:
                         print(f"  ✗ failed to download {filename}: {e}")
+                        try:
+                            log_infra(
+                                source="image_backup",
+                                log_level="error",
+                                event_type="image_download_failed",
+                                message="R2 からの画像ダウンロードに失敗しました",
+                                detail={
+                                    "bucket": R2_BUCKET_NAME,
+                                    "filename": filename,
+                                    "error": str(e),
+                                },
+                                resolved=False,
+                            )
+                        except Exception:
+                            pass
                         continue
                 zf.write(local_path, arcname=filename)
                 print(f"  ✓ added {filename} to {zip_path}")

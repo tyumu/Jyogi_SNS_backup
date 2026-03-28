@@ -11,6 +11,8 @@ from typing import List
 from dotenv import load_dotenv
 from PIL import Image, UnidentifiedImageError
 
+from infra_logging import log_infra
+
 load_dotenv()
 
 DB_FILE = os.getenv("BACKUP_DB_PATH", os.path.join("artifacts", "backup", "backup.db"))
@@ -109,6 +111,8 @@ def verify_backup():
     print("バックアップ審査を開始...\n")
     all_ok = True
 
+    issues = []  # インフラログ用: 人手対応が必要な問題の概要を溜めておく
+
     manifest_adapter = ManifestAdapter(MANIFEST_FILE)
     sqlite_adapter = SQLiteBackupAdapter(DB_FILE)
 
@@ -124,6 +128,7 @@ def verify_backup():
     if not sqlite_adapter.exists():
         print(f"  ✗ '{DB_FILE}' が見当たりません。")
         all_ok = False
+        issues.append({"type": "db_missing", "db_path": DB_FILE})
     else:
         actual_db_hash = sqlite_adapter.sha256()
         db_key_abs = os.path.abspath(DB_FILE)
@@ -133,6 +138,12 @@ def verify_backup():
         else:
             print(f"  ✗ ハッシュ値不一致: {DB_FILE} が作成時から変化しているか、壊れています。")
             all_ok = False
+            issues.append({
+                "type": "db_hash_mismatch",
+                "db_path": DB_FILE,
+                "actual_hash": actual_db_hash,
+                "expected_hash": expected_db_hash,
+            })
 
         for table in ["todos", "replies"]:
             try:
@@ -143,12 +154,20 @@ def verify_backup():
                 else:
                     print(f"  ✗ {table} テーブル: 件数不一致 (実体:{count}件 vs マニフェスト:{expected}件)")
                     all_ok = False
+                    issues.append({
+                        "type": "table_count_mismatch",
+                        "table": table,
+                        "actual": count,
+                        "expected": expected,
+                    })
             except sqlite3.OperationalError:
                 print(f"  ✗ {table} テーブルが存在しません。")
                 all_ok = False
+                issues.append({"type": "table_missing", "table": table})
             except Exception as e:
                 print(f"  ✗ {table} テーブル確認中にエラーです: {e}")
                 all_ok = False
+                issues.append({"type": "table_check_error", "table": table, "error": str(e)})
 
     print("\n📌 画像ZIPの確認")
     total_img_count = 0
@@ -169,6 +188,7 @@ def verify_backup():
         if not adapter.exists():
             print(f"  ✗ '{zip_path}' が見当たりません。")
             all_ok = False
+            issues.append({"type": "zip_missing", "zip_path": zip_path})
             continue
 
         actual_zip_hash = adapter.sha256()
@@ -178,6 +198,12 @@ def verify_backup():
         else:
             print(f"  ✗ ハッシュ値不一致: {zip_path} はマニフェスト作成時と異なります。")
             all_ok = False
+            issues.append({
+                "type": "zip_hash_mismatch",
+                "zip_path": zip_path,
+                "actual_hash": actual_zip_hash,
+                "expected_hash": expected_zip_hash,
+            })
 
         try:
             image_files = adapter.list_image_files()
@@ -196,15 +222,29 @@ def verify_backup():
                     except UnidentifiedImageError:
                         print(f"      ✗ {img_name}: 画像として読み込めません。中身が壊れています。")
                         all_ok = False
+                        issues.append({
+                            "type": "image_invalid",
+                            "zip_path": zip_path,
+                            "image_name": img_name,
+                            "error": "UnidentifiedImageError",
+                        })
                     except Exception as e:
                         print(f"      ✗ {img_name}: 検査中エラーです: {e}")
                         all_ok = False
+                        issues.append({
+                            "type": "image_check_error",
+                            "zip_path": zip_path,
+                            "image_name": img_name,
+                            "error": str(e),
+                        })
         except zipfile.BadZipFile:
             print(f"  ✗ {zip_path}: ZIPファイル自体が壊れています。")
             all_ok = False
+            issues.append({"type": "zip_corrupted", "zip_path": zip_path})
         except Exception as e:
             print(f"  ✗ {zip_path}: 画像の確認中に未知のエラーです: {e}")
             all_ok = False
+            issues.append({"type": "zip_check_error", "zip_path": zip_path, "error": str(e)})
 
     if zip_files:
         if total_img_count == expected_img_count:
@@ -212,6 +252,11 @@ def verify_backup():
         else:
             print(f"  ⚠ 全 ZIP 合計画像数不一致 (実体:{total_img_count}枚 vs マニフェスト:{expected_img_count}件)")
             all_ok = False
+            issues.append({
+                "type": "image_count_mismatch",
+                "actual_total": total_img_count,
+                "expected_total": expected_img_count,
+            })
 
     print("\n" + "=" * 40)
     print("【最終判定】")
@@ -220,10 +265,55 @@ def verify_backup():
         try:
             write_restore_ok_marker(RESTORE_OK_FILE)
             print(f"  ✓ OKファイルを生成: {RESTORE_OK_FILE}")
+            try:
+                log_infra(
+                    source="restore_smoke_test",
+                    log_level="info",
+                    event_type="backup_verification_ok",
+                    message="バックアップ整合性チェックに成功しました",
+                    detail={
+                        "db_path": DB_FILE,
+                        "manifest_path": MANIFEST_FILE,
+                        "restore_ok_marker": RESTORE_OK_FILE,
+                    },
+                    resolved=True,
+                )
+            except Exception:
+                # ログ出力で本処理を止めない
+                pass
         except Exception as e:
             print(f"  ✗ OKファイル生成エラー: {e}")
+            try:
+                log_infra(
+                    source="restore_smoke_test",
+                    log_level="error",
+                    event_type="restore_ok_marker_write_failed",
+                    message="restore_smoke_test.ok の作成に失敗しました",
+                    detail={
+                        "marker_path": RESTORE_OK_FILE,
+                        "error": str(e),
+                    },
+                    resolved=False,
+                )
+            except Exception:
+                pass
     else:
         print("  ==> [ NG ] どこかに不整合やエラー")
+        try:
+            log_infra(
+                source="restore_smoke_test",
+                log_level="error",
+                event_type="backup_verification_failed",
+                message="バックアップ整合性チェックに失敗しました",
+                detail={
+                    "db_path": DB_FILE,
+                    "manifest_path": MANIFEST_FILE,
+                    "issues": issues,
+                },
+                resolved=False,
+            )
+        except Exception:
+            pass
     print("=" * 40)
 
 

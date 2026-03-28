@@ -5,6 +5,8 @@ import boto3
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+from infra_logging import log_infra
+
 load_dotenv()
 
 POSTGRES_URL = os.getenv("POSTGRES_URL")
@@ -36,6 +38,56 @@ def require_restore_ok():
             f"復元テスト成功マーカーがありません: {RESTORE_OK_MARKER}\n"
             "先に復元テストを通してから削除してください。"
         )
+
+
+def clear_restore_ok_marker():
+    try:
+        if os.path.exists(RESTORE_OK_MARKER):
+            os.remove(RESTORE_OK_MARKER)
+            print(f"復元テスト成功マーカーを削除しました: {RESTORE_OK_MARKER}")
+    except Exception as e:
+        # マーカー削除に失敗しても本処理は成功扱いとし、警告だけ出す
+        msg = f"復元テスト成功マーカー削除に失敗しました: {e}"
+        print(msg)
+        try:
+            log_infra(
+                source="delete_with_guard",
+                log_level="WARN",
+                event_type="restore_ok_marker_delete_failed",
+                message="restore_smoke_test.ok の削除に失敗しました",
+                detail={
+                    "marker_path": RESTORE_OK_MARKER,
+                    "error": str(e),
+                },
+                resolved=False,
+            )
+        except Exception:
+            # ログ出力自体が失敗しても、削除処理は続行する
+            pass
+
+
+def clear_delete_plan_file():
+    try:
+        if os.path.exists(DELETE_PLAN_PATH):
+            os.remove(DELETE_PLAN_PATH)
+            print(f"削除計画ファイルを削除しました: {DELETE_PLAN_PATH}")
+    except Exception as e:
+        msg = f"削除計画ファイルの削除に失敗しました: {e}"
+        print(msg)
+        try:
+            log_infra(
+                source="delete_with_guard",
+                log_level="WARN",
+                event_type="delete_plan_delete_failed",
+                message="delete_plan.json の削除に失敗しました",
+                detail={
+                    "plan_path": DELETE_PLAN_PATH,
+                    "error": str(e),
+                },
+                resolved=False,
+            )
+        except Exception:
+            pass
 
 
 def precheck_counts(conn, todo_ids, reply_ids):
@@ -150,6 +202,24 @@ def main():
                 "replies_found_before_delete": before_replies
             }
             write_result(result)
+            try:
+                log_infra(
+                    source="delete_with_guard",
+                    log_level="info",
+                    event_type="delete_dry_run_completed",
+                    message="削除DRY-RUNが完了しました",
+                    detail={
+                        "threshold_days": threshold_days,
+                        "todos_planned": len(todo_ids),
+                        "replies_planned": len(reply_ids),
+                        "images_planned": len(image_keys),
+                        "todos_found_before_delete": before_todos,
+                        "replies_found_before_delete": before_replies,
+                    },
+                    resolved=True,
+                )
+            except Exception:
+                pass
             conn.rollback()
             return
 
@@ -172,9 +242,54 @@ def main():
         }
         write_result(result)
 
+        try:
+            log_infra(
+                source="delete_with_guard",
+                log_level="info",
+                event_type="delete_execute_completed",
+                message="削除処理が正常終了しました",
+                detail={
+                    "threshold_days": threshold_days,
+                    "todos_planned": len(todo_ids),
+                    "replies_planned": len(reply_ids),
+                    "images_planned": len(image_keys),
+                    "todos_deleted": deleted_todos,
+                    "replies_deleted": deleted_replies,
+                    "images_deleted": deleted_images,
+                    "image_delete_errors_count": len(image_errors),
+                },
+                resolved=True,
+            )
+        except Exception:
+            pass
+
+        # 削除が正常終了したら、次回以降のためにOKマーカーを消す
+        clear_restore_ok_marker()
+
+        # 削除計画ファイルも使い捨てにしておくことで、
+        # 古い delete_plan.json を再利用した 2 回目以降実行のズレを防ぐ
+        clear_delete_plan_file()
+
     except Exception as e:
         conn.rollback()
         print("削除中にエラー。ロールバックしました。")
+        try:
+            log_infra(
+                source="delete_with_guard",
+                log_level="error",
+                event_type="delete_execute_failed",
+                message="削除処理中にエラーが発生しました",
+                detail={
+                    "threshold_days": threshold_days,
+                    "todos_planned": len(todo_ids),
+                    "replies_planned": len(reply_ids),
+                    "images_planned": len(image_keys),
+                    "error": str(e),
+                },
+                resolved=False,
+            )
+        except Exception:
+            pass
         raise e
     finally:
         conn.close()
