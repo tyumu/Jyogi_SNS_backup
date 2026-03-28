@@ -74,7 +74,7 @@
 
 - [infra_logging.py](infra_logging.py)
   - Supabase の `public.infrastructure_logs` テーブルに、
-    - `nightly_backup_start` / `nightly_backup_success` / `nightly_backup_failed` などのイベントを INSERT する薄いロガー
+    - バックアップ関連の各種イベントを INSERT する薄いロガー（詳細は「インフラログのイベント一覧」を参照）
   - ログ保存に失敗してもバックアップ処理自体は止めない設計
 
 ---
@@ -113,6 +113,29 @@
   - `infrastructure_logs.environment` に入る環境名。
   - 例: `prod` / `staging` / `dev` など。
 
+### インフラログのイベント一覧
+
+`.env` で `INFRA_LOG_DB_URL` を設定している場合、`public.infrastructure_logs` にはおおよそ次のようなイベントが保存されます（`environment` / `run_id` / `source` / `log_level` / `message` / `detail` 付き）。
+
+- 夜間バッチ全体の状態（source=`raspberry_pi`）
+  - `nightly_backup_start` (info): `main.py` 実行開始
+  - `nightly_backup_success` (info): バッチ全体が正常終了（`threshold_days` や ZIP ファイル数などを `detail` に含む）
+  - `nightly_backup_failed` (error): どこかで例外が発生してバッチ全体が失敗
+- 画像バックアップ関連（source=`image_backup` / `image_backup.iter_image_records`）
+  - `image_download_failed` (error): R2 から画像のダウンロードに失敗
+  - `image_backup_invalid_todo_id` (warn): `backup.db` 内の `todos.id` が数値に変換できずスキップされた
+  - `image_backup_invalid_created_at` (warn): `created_at` の日付フォーマットが解釈できずスキップされた
+- 復元スモークテスト関連（source=`restore_smoke_test`）
+  - `backup_verification_ok` (info): バックアップ整合性チェックが成功し、`restore_smoke_test.ok` を作成できた
+  - `restore_ok_marker_write_failed` (error): OK マーカー (`restore_smoke_test.ok`) の作成に失敗
+  - `backup_verification_failed` (error): バックアップ整合性チェックで不整合やエラーが見つかった（詳細は `issues` 配列として `detail` に格納）
+- 削除処理関連（source=`delete_with_guard`）
+  - `delete_dry_run_completed` (info): `.env` の設定により DRY-RUN モードで削除計画を検証し終えた
+  - `delete_execute_completed` (info): 実際の削除（DB + R2）が正常終了（削除件数などを `detail` に含む）
+  - `delete_execute_failed` (error): 削除処理中にエラーが発生しロールバックした
+  - `restore_ok_marker_delete_failed` (warn): 削除完了後に `restore_smoke_test.ok` を消そうとして失敗
+  - `delete_plan_delete_failed` (warn): 削除計画ファイル `delete_plan.json` の削除に失敗
+
 ### 削除ガード
 
 - `VERIFY_ONLY` (既定: `true`)
@@ -127,6 +150,21 @@
 ---
 
 ## ローカルでの動かし方
+
+### ログ出力の概要
+
+- `python main.py` を実行すると、標準出力に
+  - `=== Nightly backup start ===` / `=== Nightly backup done ===`
+  - 使われた `backup.db` / 画像 ZIP / マニフェストのパス
+  - しきい値日数 (`threshold_days`)
+  がまとめて表示されます。
+- 途中で例外が発生すると、`[ERROR] Nightly backup failed.` とエラーメッセージが標準出力に出ます（戻り値は 1）。
+- ラズパイで `scripts/run_main_nightly.sh` 経由で実行した場合は、これら標準出力が [artifacts/logs/main_nightly.log](artifacts/logs/main_nightly.log) に追記されます。
+- `.env` で `INFRA_LOG_DB_URL` / `INFRA_ENVIRONMENT` を設定している場合は、Supabase の `public.infrastructure_logs` にも
+  - `nightly_backup_start`
+  - `nightly_backup_success`
+  - `nightly_backup_failed`
+  のイベントが 1 実行あたり 1 レコードずつ保存されます。
 
 ### 1. 仮想環境と依存パッケージ
 
@@ -182,6 +220,26 @@ crontab -l
   - `INFRA_LOG_DB_URL` / `INFRA_ENVIRONMENT` を設定しておくと、この実行ごとに Supabase の `infrastructure_logs` に 1 レコードずつ蓄積されます。
 
   例: `source='raspberry_pi'`, `event_type='nightly_backup_success'` / `'nightly_backup_failed'` など。
+
+---
+## ラズパイのセキュリティ対策と今後
+
+### 最低限以下を設定してから運用を開始する
+部室の共有ラズパイにおいて、機密情報の漏洩および意図しないスクリプトの改ざんを防ぐため、最低限以下のアクセス制限を実施してから運用を開始
+ - 機密情報（.env）の保護
+   - ファイルの所有者を root に変更し、権限を 400（rootの読み取りのみ）に制限。一般ユーザーからの閲覧を完全にブロック。
+ - 実行スクリプト（.py）の保護
+   - スクリプトの所有者を root に変更し、一般ユーザーからの書き込み権限を剥奪。悪意あるコード（.env の中身を外部送信するなど）の追記を防止。
+ - 成果物（artifacts/）の利便性確保
+   - root 権限の cron で毎晩スクリプトを実行し、完了直後に chown コマンドで生成物の所有権を一般ユーザー（pi 等）に譲渡するよう設定。これにより、機密を守りつつ一般部員が自由にデータのコピーや整理を行える状態を構築。
+### 今後の展望（課題）
+現在の構成はあくまで暫定的な応急処置。より安全で持続可能な運用を目指し、今後は以下の改善を検討・実施予定。
+ - 公開鍵認証の導入
+   - パスワードの使い回しや総当たり攻撃を防ぐため、SSH接続を公開鍵認証のみに制限します。
+ - Docker等による実行環境のコンテナ化
+   - ホストOS（ラズパイ本体）の権限で直接スクリプトを動かすのではなく、コンテナ内に隔離することで、万が一スクリプトに脆弱性があってもシステム全体に被害が及ばないようにする。
+ - 実行ログ・アクセス監視の導入
+   - いつ、誰がログインして何を実行したのか、監査ログを残す仕組みを構築（アプリ実行ログ（infrastructure_logs）と OS レベルの監査ログを組み合わせる）。
 
 ---
 
