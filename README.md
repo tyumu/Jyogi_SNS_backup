@@ -17,9 +17,9 @@
 
 1. 毎晩 `main.py` を実行（cron など）
 2. `main.py` がやること
-   1. 3か月以上前の `todos` / `replies` を PostgreSQL から `backup.db` に追記
-   2. `backup.db` を元に、画像を月別 ZIP (`images_backup_YYYYMM.zip`) に追記
-   3. `backup.db` と ZIP 群のハッシュ・件数・"ZIP 済み max(id)" を `artifacts/backup_manifest.json` に出力
+  1. 3か月以上前の `todos` / `replies` を PostgreSQL から年別 SQLite (`jyogi_sns_backup_YYYY.db`) に追記
+  2. 年別 SQLite 群を元に、画像を月別 ZIP (`images_backup_YYYYMM.zip`) に追記
+  3. 年別 SQLite 群と ZIP 群のハッシュ・件数・"ZIP 済み max(id)" を `artifacts/backup_manifest.json` に出力
    4. `scripts/restore_smoke_test.py` でバックアップ整合性チェック → OK なら `artifacts/restore_smoke_test.ok` を作成
    5. `scripts/generate_delete_plan.py` で「3か月前より古い投稿」の削除計画 (`artifacts/delete_plan.json`) を生成
    6. `scripts/delete_with_guard.py` でガード付き削除（`.env` のフラグ次第で DRY-RUN or 本削除）
@@ -37,23 +37,24 @@
 - [backup/](backup)
   - [db_backup.py](backup/db_backup.py)
     - `backup_old_rows_to_sqlite()`
-    - 3か月以上前の `todos` / `replies` を Supabase(PostgreSQL) から [artifacts/backup/backup.db](artifacts/backup/backup.db) に追記（`INSERT OR IGNORE`）
+    - 3か月以上前の `todos` / `replies` を Supabase(PostgreSQL) から [artifacts/backup/](artifacts/backup) 配下の `jyogi_sns_backup_YYYY.db` に追記（`INSERT OR IGNORE`）
   - [image_backup.py](backup/image_backup.py)
-    - `download_and_zip_images_by_month(sqlite_path)`
-    - `backup.db` の `todos` から `image_url` / `created_at` を見て、R2 から画像を取得し、[artifacts/images/](artifacts/images) 配下の `images_backup_YYYYMM.zip` に月別で追記
+    - `download_and_zip_images_by_month(sqlite_paths)`
+    - 年別 SQLite 群の `todos` から `image_url` / `created_at` を見て、R2 から画像を取得し、[artifacts/images/](artifacts/images) 配下の `images_backup_YYYYMM.zip` に月別で追記
     - マニフェストの `image_max_todo_id_zipped` を見て、前回までに ZIP 済みの `id` より大きい行だけを対象にする（インクリメンタル）
   - [manifest.py](backup/manifest.py)
-    - `create_manifest(db_path, zip_paths, max_todo_id_zipped)`
-    - `backup.db` と ZIP 群について
+    - `create_manifest(db_paths, zip_paths, max_todo_id_zipped)`
+    - 年別 SQLite 群と ZIP 群について
       - 件数 (`todos` / `replies` / `image_urls`)
       - 各ファイルの SHA256 ハッシュ
+      - 年別DBファイルの絶対パス一覧 (`db_files`)
       - ZIP ファイルの絶対パス一覧 (`zip_files`)
       - 画像として ZIP 済みとみなす最大 `todos.id` (`image_max_todo_id_zipped`)
     - を [artifacts/backup_manifest.json](artifacts/backup_manifest.json) に出力
 
 - [scripts/](scripts)
   - [restore_smoke_test.py](scripts/restore_smoke_test.py)
-    - `artifacts/backup_manifest.json` と [artifacts/backup/backup.db](artifacts/backup/backup.db) / [artifacts/images/](artifacts/images) 配下の `images_backup_YYYYMM.zip` 群を使って、
+    - `artifacts/backup_manifest.json` と [artifacts/backup/](artifacts/backup) 配下の `jyogi_sns_backup_YYYY.db` 群 / [artifacts/images/](artifacts/images) 配下の `images_backup_YYYYMM.zip` 群を使って、
       - DB ハッシュ・件数
       - 各 ZIP のハッシュ・画像枚数
       - サンプル画像の整合性
@@ -98,7 +99,8 @@
 
 ### バックアップ関連
 
-- `BACKUP_DB_PATH` (任意, 既定: `artifacts/backup/backup.db`)
+- `BACKUP_DB_PATH` (任意, 既定: `artifacts/backup/jyogi_sns_backup.db`)
+  - 年別DBファイル名のテンプレートとして使われ、実体は `*_YYYY.db` で生成される
 - `BACKUP_THRESHOLD_DAYS` (任意, 既定: `90`)
   - 何日前より前を「古い投稿」とみなすか
 - `BACKUP_IMAGES_DIR` (任意, 既定: `artifacts/images`)
@@ -123,7 +125,7 @@
   - `nightly_backup_failed` (error): どこかで例外が発生してバッチ全体が失敗
 - 画像バックアップ関連（source=`image_backup` / `image_backup.iter_image_records`）
   - `image_download_failed` (error): R2 から画像のダウンロードに失敗
-  - `image_backup_invalid_todo_id` (warn): `backup.db` 内の `todos.id` が数値に変換できずスキップされた
+  - `image_backup_invalid_todo_id` (warn): 年別DB内の `todos.id` が数値に変換できずスキップされた
   - `image_backup_invalid_created_at` (warn): `created_at` の日付フォーマットが解釈できずスキップされた
 - 復元スモークテスト関連（source=`restore_smoke_test`）
   - `backup_verification_ok` (info): バックアップ整合性チェックが成功し、`restore_smoke_test.ok` を作成できた
@@ -155,7 +157,7 @@
 
 - `python main.py` を実行すると、標準出力に
   - `=== Nightly backup start ===` / `=== Nightly backup done ===`
-  - 使われた `backup.db` / 画像 ZIP / マニフェストのパス
+  - 使われた年別DB一覧 / 画像 ZIP / マニフェストのパス
   - しきい値日数 (`threshold_days`)
   がまとめて表示されます。
 - 途中で例外が発生すると、`[ERROR] Nightly backup failed.` とエラーメッセージが標準出力に出ます（戻り値は 1）。
@@ -284,13 +286,13 @@ crontab -l
 
 ざっくり案:
 
-1. backup.db を読む専用 API / サービス
-  - ローカルの`backup.db` を読み込み専用でマウントする（File API使用）。
+1. 年別バックアップDB (`jyogi_sns_backup_YYYY.db`) を読む専用 API / サービス
+  - ローカルの年別DB群を読み込み専用でマウントする（File API使用）。
   - この DB には「3か月以上前で、本番DBから削除済みの履歴」だけが入っている前提。
 
 2. 「アーカイブ専用」検索＆閲覧ページ
   - 通常のタイムラインとは別に、メニューから遷移できる「アーカイブ閲覧ページ」を用意する。
-  - ここでは `backup.db` だけを検索対象にし、
+  - ここでは年別バックアップDB群だけを検索対象にし、
     - ユーザーID / 日付 / キーワード などで `todos` / `replies` を検索
     - 結果をテキストのみで一覧表示
 
@@ -300,12 +302,12 @@ crontab -l
   - フロー案:
     1. ユーザーがブラウザ上で `images_backup_YYYYMM.zip` を選択
     2. フロントエンド側で ZIP を解凍し、Blob URL (`URL.createObjectURL`) に変換
-    3. `backup.db` 内の `image_url` のファイル名と ZIP 内のファイル名を突き合わせ、該当する Blob URL を `<img src=...>` として表示
+    3. 年別バックアップDB内の `image_url` のファイル名と ZIP 内のファイル名を突き合わせ、該当する Blob URL を `<img src=...>` として表示
   - サーバー側に ZIP を永続保存しない（フロント側だけで展開して表示）ことで、R2 や別ストレージへの再アップロードを避けつつ、必要なときだけユーザー側から持ち込んでもらう構成にできる。
 
 4. 設計上のポイント
   - 「バックアップ分はバックアップ専用ページでしか見ない」ルールにしておくと、本番DB側のロジックを汚さずに済む。
-  - `backup.db` / `images_backup_YYYYMM.zip` はあくまで「外部アーカイブ」として扱い、アプリ本体 DB とは疎結合に保つ。
+  - 年別バックアップDB (`jyogi_sns_backup_YYYY.db`) / `images_backup_YYYYMM.zip` はあくまで「外部アーカイブ」として扱い、アプリ本体 DB とは疎結合に保つ。
   - 画像周りは、将来必要になった時点で「サーバー側に再アップロードしてキャッシュする」等の拡張も可能だが、最初は「ローカル ZIP をブラウザに読み込ませるだけ」の構成が安全でシンプル。
 
 ---
@@ -327,7 +329,7 @@ crontab -l
   - 将来、アプリ本体リポジトリ側にも簡易ビューを用意して、「最近 N 回分のバックアップ状況」を一覧できるようにする。
 
 - セキュリティ / プライバシー
-  - `backup.db` や `images_backup_YYYYMM.zip` を暗号化して保存するオプション（例: OpenSSL / age / GPG など）。
+  - 年別バックアップDB (`jyogi_sns_backup_YYYY.db`) や `images_backup_YYYYMM.zip` を暗号化して保存するオプション（例: OpenSSL / age / GPG など）。
   - 暗号鍵の管理を `.env` ではなく、将来的には別のシークレットストアに移せるように抽象化する。
 
 - パフォーマンス / スケール
