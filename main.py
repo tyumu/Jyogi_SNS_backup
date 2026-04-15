@@ -3,7 +3,11 @@ import sys
 
 from dotenv import load_dotenv
 
-from backup.db_backup import backup_old_rows_to_sqlite, BACKUP_DB_PATH, DELETION_THRESHOLD_DAYS
+from backup.db_backup import (
+    backup_old_rows_to_sqlite,
+    list_yearly_backup_db_paths,
+    DELETION_THRESHOLD_DAYS,
+)
 from backup.image_backup import download_and_zip_images_by_month
 from backup.manifest import create_manifest
 from infra_logging import log_infra
@@ -27,16 +31,18 @@ def main():
             message="Nightly backup started.",
         )
 
-        # 1) PostgreSQL -> SQLite (3か月以上前のみ追記)
-        backup_old_rows_to_sqlite()
+        # 1) PostgreSQL -> SQLite(年別 *_YYYY.db) に追記
+        db_paths = backup_old_rows_to_sqlite()
+        if not db_paths:
+            db_paths = list_yearly_backup_db_paths()
 
         # 2) R2 画像を月別 ZIP に分割してバックアップ（インクリメンタル）
-        zip_paths, max_todo_id_zipped = download_and_zip_images_by_month(BACKUP_DB_PATH)
+        zip_paths, max_todo_id_zipped = download_and_zip_images_by_month(db_paths)
 
         # 3) マニフェスト生成（絶対パス & max(id) 記録）
-        manifest_path = create_manifest(BACKUP_DB_PATH, zip_paths, max_todo_id_zipped)
+        manifest_path = create_manifest(db_paths, zip_paths, max_todo_id_zipped)
 
-        # 4) 復元スモークテスト（backup.db と ZIP 群の整合性チェック）
+        # 4) 復元スモークテスト（年別DB群と ZIP 群の整合性チェック）
         restore_smoke_test_mod.verify_backup()
 
         # 5) 削除計画生成（3か月以上前の todos/replies を delete_plan.json に出力）
@@ -47,7 +53,12 @@ def main():
         delete_with_guard_mod.main()
 
         print("\n=== Nightly backup done ===")
-        print(f"  backup.db          : {os.path.abspath(BACKUP_DB_PATH)}")
+        print("  yearly db files    :")
+        if db_paths:
+            for dbp in db_paths:
+                print(f"    - {os.path.abspath(dbp)}")
+        else:
+            print("    - (no db files)")
         print(f"  zip files (monthly):")
         for zp in zip_paths:
             print(f"    - {os.path.abspath(zp)}")
@@ -61,6 +72,7 @@ def main():
             message="Nightly backup completed successfully.",
             detail={
                 "threshold_days": DELETION_THRESHOLD_DAYS,
+                "yearly_db_file_count": len(db_paths),
                 "zip_file_count": len(zip_paths),
             },
         )
