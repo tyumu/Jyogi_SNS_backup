@@ -12,6 +12,26 @@ load_dotenv()
 MANIFEST_PATH = os.getenv("BACKUP_MANIFEST_PATH", os.path.join("artifacts", "backup_manifest.json"))
 
 
+def _normalize_path_list(paths) -> List[str]:
+    if paths is None:
+        return []
+
+    if isinstance(paths, (str, os.PathLike)):
+        raw_paths = [paths]
+    else:
+        raw_paths = list(paths)
+
+    normalized = []
+    seen = set()
+    for path in raw_paths:
+        abs_path = os.path.abspath(str(path))
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        normalized.append(abs_path)
+    return normalized
+
+
 def calculate_sha256(file_path):
     if not os.path.exists(file_path):
         return None
@@ -22,15 +42,15 @@ def calculate_sha256(file_path):
     return sha256_hash.hexdigest()
 
 
-def create_manifest(db_path: str, zip_paths: Iterable[str], max_todo_id_zipped: Optional[int] = None) -> str:
-    """backup.db と複数 ZIP をまとめたマニフェストを BACKUP_MANIFEST_PATH（既定: artifacts/backup_manifest.json）に生成
+def create_manifest(db_paths, zip_paths: Iterable[str], max_todo_id_zipped: Optional[int] = None) -> str:
+    """年別DB群と複数 ZIP をまとめたマニフェストを BACKUP_MANIFEST_PATH に生成
 
     max_todo_id_zipped: 画像ZIP生成時点で "ここまでの todos.id は ZIP 済み" という境界
     """
     print("\n📌 マニフェスト作成...")
 
-    db_abs = os.path.abspath(db_path)
-    zip_abs_list = [os.path.abspath(p) for p in zip_paths]
+    db_abs_list = _normalize_path_list(db_paths)
+    zip_abs_list = _normalize_path_list(zip_paths)
 
     manifest = {
         "generated_at": datetime.now().isoformat(),
@@ -40,19 +60,24 @@ def create_manifest(db_path: str, zip_paths: Iterable[str], max_todo_id_zipped: 
             "image_urls": 0,
         },
         "hashes": {},
+        "db_files": [],
         "zip_files": [],  # 追跡しておく（絶対パス）
         "image_max_todo_id_zipped": int(max_todo_id_zipped or 0),
     }
 
-    # 1. SQLite の件数
-    if os.path.exists(db_abs):
+    # 1. SQLite(年別DB群) の件数を合算
+    for db_abs in db_abs_list:
+        manifest["db_files"].append(db_abs)
+        if not os.path.exists(db_abs):
+            continue
+
         conn = sqlite3.connect(db_abs)
         cur = conn.cursor()
         try:
             for table in ["todos", "replies"]:
                 try:
                     cur.execute(f"SELECT COUNT(*) FROM {table}")
-                    manifest["counts"][table] = cur.fetchone()[0]
+                    manifest["counts"][table] += cur.fetchone()[0]
                 except sqlite3.OperationalError:
                     pass
 
@@ -64,7 +89,7 @@ def create_manifest(db_path: str, zip_paths: Iterable[str], max_todo_id_zipped: 
                     WHERE image_url IS NOT NULL AND TRIM(image_url) != ''
                     """
                 )
-                manifest["counts"]["image_urls"] = cur.fetchone()[0]
+                manifest["counts"]["image_urls"] += cur.fetchone()[0]
             except sqlite3.OperationalError:
                 pass
         finally:
@@ -72,11 +97,11 @@ def create_manifest(db_path: str, zip_paths: Iterable[str], max_todo_id_zipped: 
             conn.close()
 
     # 2. ハッシュ値
-    files_to_hash: List[str] = [db_abs] + list(zip_abs_list)
+    files_to_hash: List[str] = list(db_abs_list) + list(zip_abs_list)
     for file_path in files_to_hash:
         if os.path.exists(file_path):
             manifest["hashes"][file_path] = calculate_sha256(file_path)
-            if file_path != db_abs:
+            if file_path in zip_abs_list:
                 manifest["zip_files"].append(file_path)
 
     # 出力先は環境変数 BACKUP_MANIFEST_PATH（既定: artifacts/backup_manifest.json）

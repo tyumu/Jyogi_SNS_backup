@@ -48,65 +48,105 @@ def _load_last_max_id_from_manifest() -> int:
         return 0
 
 
-def iter_image_records(sqlite_path, min_id_exclusive: int = 0):
-    """SQLite の todos から (id, filename, month_key) を列挙（id > min_id_exclusive のみ）"""
-    conn = sqlite3.connect(sqlite_path)
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            SELECT id, image_url, created_at
-            FROM todos
-            WHERE image_url IS NOT NULL
-              AND TRIM(image_url) != ''
-              AND id > ?
-            ORDER BY id ASC
-            """,
-            (min_id_exclusive,),
-        )
-        for todo_id, url, created_at in cur.fetchall():
-            if not url:
-                continue
-            # id は TEXT で入っているので Python 側で int に揃える
-            try:
-                todo_id_int = int(todo_id)
-            except (TypeError, ValueError):
-                log_infra(
-                    source="image_backup.iter_image_records",
-                    log_level="warn",
-                    event_type="image_backup_invalid_todo_id",
-                    message="非数値の todo_id がスキップされました",
-                    detail={"raw_todo_id": todo_id, "url": url},
-                )
-                # 数値に変換できない id はスキップ
-                continue
+def _normalize_sqlite_paths(sqlite_paths) -> list[str]:
+    if sqlite_paths is None:
+        return []
 
-            filename = url.split("/")[-1]
-            try:
-                dt = datetime.fromisoformat(str(created_at))
-            except Exception:
-                log_infra(
-                    source="image_backup.iter_image_records",
-                    log_level="warn",
-                    event_type="image_backup_invalid_created_at",
-                    message="created_at のフォーマット不明のためスキップされました",
-                    detail={
-                        "raw_created_at": created_at,
-                        "todo_id": todo_id,
-                        "url": url,
-                    },
-                )
-                # フォーマット不明な場合はスキップ
-                continue
-            month_key = dt.strftime("%Y%m")  # 例: 202603
-            yield todo_id_int, filename, month_key
-    finally:
-        cur.close()
-        conn.close()
+    if isinstance(sqlite_paths, (str, os.PathLike)):
+        candidates = [sqlite_paths]
+    else:
+        candidates = list(sqlite_paths)
+
+    normalized = []
+    seen = set()
+    for path in candidates:
+        abs_path = os.path.abspath(str(path))
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        normalized.append(abs_path)
+    return normalized
 
 
-def download_and_zip_images_by_month(sqlite_path):
-    """backup.db をもとに R2 から画像をダウンロードし、月別 ZIP を作成/追記する
+def iter_image_records(sqlite_paths, min_id_exclusive: int = 0):
+    """複数 SQLite の todos から (id, filename, month_key) を列挙（id > min_id_exclusive のみ）"""
+    for sqlite_path in _normalize_sqlite_paths(sqlite_paths):
+        if not os.path.exists(sqlite_path):
+            log_infra(
+                source="image_backup.iter_image_records",
+                log_level="warn",
+                event_type="image_backup_missing_db_file",
+                message="DBファイルが存在しないためスキップされました",
+                detail={"db_path": sqlite_path},
+            )
+            continue
+
+        conn = sqlite3.connect(sqlite_path)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT id, image_url, created_at
+                FROM todos
+                WHERE image_url IS NOT NULL
+                  AND TRIM(image_url) != ''
+                  AND id > ?
+                ORDER BY id ASC
+                """,
+                (min_id_exclusive,),
+            )
+            for todo_id, url, created_at in cur.fetchall():
+                if not url:
+                    continue
+                # id は TEXT で入っているので Python 側で int に揃える
+                try:
+                    todo_id_int = int(todo_id)
+                except (TypeError, ValueError):
+                    log_infra(
+                        source="image_backup.iter_image_records",
+                        log_level="warn",
+                        event_type="image_backup_invalid_todo_id",
+                        message="非数値の todo_id がスキップされました",
+                        detail={"raw_todo_id": todo_id, "url": url, "db_path": sqlite_path},
+                    )
+                    # 数値に変換できない id はスキップ
+                    continue
+
+                filename = url.split("/")[-1]
+                try:
+                    dt = datetime.fromisoformat(str(created_at))
+                except Exception:
+                    log_infra(
+                        source="image_backup.iter_image_records",
+                        log_level="warn",
+                        event_type="image_backup_invalid_created_at",
+                        message="created_at のフォーマット不明のためスキップされました",
+                        detail={
+                            "raw_created_at": created_at,
+                            "todo_id": todo_id,
+                            "url": url,
+                            "db_path": sqlite_path,
+                        },
+                    )
+                    # フォーマット不明な場合はスキップ
+                    continue
+                month_key = dt.strftime("%Y%m")  # 例: 202603
+                yield todo_id_int, filename, month_key
+        except sqlite3.OperationalError as e:
+            log_infra(
+                source="image_backup.iter_image_records",
+                log_level="warn",
+                event_type="image_backup_db_scan_failed",
+                message="DBの読み取りに失敗したためスキップされました",
+                detail={"db_path": sqlite_path, "error": str(e)},
+            )
+        finally:
+            cur.close()
+            conn.close()
+
+
+def download_and_zip_images_by_month(sqlite_paths):
+    """年別 SQLite 群をもとに R2 から画像をダウンロードし、月別 ZIP を作成/追記する
 
     戻り値: (更新した ZIP ファイルの絶対パスリスト, 今回までに ZIP 済みとなった max(id))
     """
@@ -117,11 +157,16 @@ def download_and_zip_images_by_month(sqlite_path):
     last_max_id = _load_last_max_id_from_manifest()
     print(f"📌 画像バックアップ: 直近 ZIP 済み max(id) = {last_max_id}")
 
+    sqlite_path_list = _normalize_sqlite_paths(sqlite_paths)
+    if not sqlite_path_list:
+        print("📌 画像バックアップ: 対象DBが見つからないため ZIP 更新をスキップします")
+        return [], last_max_id
+
     # month_key -> set(filenames)
     monthly_files = {}
     processed_max_id = last_max_id
 
-    for todo_id, filename, month_key in iter_image_records(sqlite_path, min_id_exclusive=last_max_id):
+    for todo_id, filename, month_key in iter_image_records(sqlite_path_list, min_id_exclusive=last_max_id):
         monthly_files.setdefault(month_key, set()).add(filename)
         if todo_id > processed_max_id:
             processed_max_id = todo_id

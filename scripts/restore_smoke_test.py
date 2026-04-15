@@ -1,8 +1,10 @@
 import hashlib
+import glob
 import io
 import json
 import os
 import random
+import re
 import sqlite3
 import zipfile
 from dataclasses import dataclass
@@ -15,9 +17,30 @@ from infra_logging import log_infra
 
 load_dotenv()
 
-DB_FILE = os.getenv("BACKUP_DB_PATH", os.path.join("artifacts", "backup", "backup.db"))
+DB_FILE = os.getenv("BACKUP_DB_PATH", os.path.join("artifacts", "backup", "jyogi_sns_backup.db"))
 MANIFEST_FILE = os.getenv("BACKUP_MANIFEST_PATH", os.path.join("artifacts", "backup_manifest.json"))
 RESTORE_OK_FILE = os.getenv("RESTORE_OK_MARKER", os.path.join("artifacts", "restore_smoke_test.ok"))
+
+
+def list_yearly_backup_db_paths_from_template(path_template: str) -> List[str]:
+    backup_dir = os.path.dirname(path_template) or "."
+    base = os.path.basename(path_template)
+    stem, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".db"
+
+    pattern = os.path.join(backup_dir, f"{stem}_*{ext}")
+    regex = re.compile(rf"^{re.escape(stem)}_(\d{{4}}){re.escape(ext)}$")
+
+    year_file_pairs = []
+    for path in glob.glob(pattern):
+        name = os.path.basename(path)
+        match = regex.match(name)
+        if not match:
+            continue
+        year_file_pairs.append((int(match.group(1)), os.path.abspath(path)))
+
+    return [p for _, p in sorted(year_file_pairs, key=lambda x: x[0])]
 
 
 def calculate_sha256(file_path):
@@ -34,6 +57,7 @@ def calculate_sha256(file_path):
 class ManifestData:
     counts: dict
     hashes: dict
+    db_files: List[str]
     zip_files: List[str]
     image_max_todo_id_zipped: int
 
@@ -50,6 +74,7 @@ class ManifestAdapter:
         return ManifestData(
             counts=manifest.get("counts", {}),
             hashes=manifest.get("hashes", {}),
+            db_files=manifest.get("db_files", []),
             zip_files=manifest.get("zip_files", []),
             image_max_todo_id_zipped=int(manifest.get("image_max_todo_id_zipped", 0) or 0),
         )
@@ -69,8 +94,12 @@ class SQLiteBackupAdapter:
         conn = sqlite3.connect(self.db_path)
         try:
             cur = conn.cursor()
-            cur.execute(f"SELECT COUNT(*) FROM {table_name}")
-            return cur.fetchone()[0]
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+                return cur.fetchone()[0]
+            except sqlite3.OperationalError:
+                # 一部年のDBでテーブルが存在しないのは許容（0件として扱う）
+                return 0
         finally:
             conn.close()
 
@@ -114,8 +143,6 @@ def verify_backup():
     issues = []  # インフラログ用: 人手対応が必要な問題の概要を溜めておく
 
     manifest_adapter = ManifestAdapter(MANIFEST_FILE)
-    sqlite_adapter = SQLiteBackupAdapter(DB_FILE)
-
     print("📌 マニフェストの確認")
     try:
         manifest = manifest_adapter.load()
@@ -124,50 +151,73 @@ def verify_backup():
         print(f"  ✗ マニフェストファイルの読み込みエラーです: {e}")
         return
 
-    print("\n📌 データベースの確認")
-    if not sqlite_adapter.exists():
-        print(f"  ✗ '{DB_FILE}' が見当たりません。")
-        all_ok = False
-        issues.append({"type": "db_missing", "db_path": DB_FILE})
-    else:
-        actual_db_hash = sqlite_adapter.sha256()
-        db_key_abs = os.path.abspath(DB_FILE)
-        expected_db_hash = manifest.hashes.get(db_key_abs) or manifest.hashes.get(os.path.basename(DB_FILE))
-        if actual_db_hash == expected_db_hash:
-            print(f"  ✓ ハッシュ値一致: {DB_FILE} は改ざんされていません。")
-        else:
-            print(f"  ✗ ハッシュ値不一致: {DB_FILE} が作成時から変化しているか、壊れています。")
-            all_ok = False
-            issues.append({
-                "type": "db_hash_mismatch",
-                "db_path": DB_FILE,
-                "actual_hash": actual_db_hash,
-                "expected_hash": expected_db_hash,
-            })
+    print("\n📌 データベース(年別)の確認")
+    db_files = [os.path.abspath(p) for p in (manifest.db_files or [])]
 
-        for table in ["todos", "replies"]:
-            try:
-                count = sqlite_adapter.count_table_rows(table)
-                expected = manifest.counts.get(table, 0)
-                if count == expected:
-                    print(f"  ✓ {table} テーブル: {count} 件（マニフェストと完全に一致）")
-                else:
-                    print(f"  ✗ {table} テーブル: 件数不一致 (実体:{count}件 vs マニフェスト:{expected}件)")
+    # 旧マニフェスト互換: db_files が無い場合は既存の年別DB一覧、最後に単一DBパスへフォールバック
+    if not db_files:
+        db_files = list_yearly_backup_db_paths_from_template(DB_FILE)
+    if not db_files:
+        fallback_db = os.path.abspath(DB_FILE)
+        if os.path.exists(fallback_db):
+            db_files = [fallback_db]
+
+    if not db_files:
+        print("  ⚠ 確認対象のDBファイルがありません。")
+    else:
+        total_counts = {"todos": 0, "replies": 0}
+
+        for db_path in db_files:
+            sqlite_adapter = SQLiteBackupAdapter(db_path)
+
+            if not sqlite_adapter.exists():
+                print(f"  ✗ '{db_path}' が見当たりません。")
+                all_ok = False
+                issues.append({"type": "db_missing", "db_path": db_path})
+                continue
+
+            actual_db_hash = sqlite_adapter.sha256()
+            expected_db_hash = manifest.hashes.get(db_path) or manifest.hashes.get(os.path.basename(db_path))
+            if actual_db_hash == expected_db_hash:
+                print(f"  ✓ ハッシュ値一致: {db_path} は改ざんされていません。")
+            else:
+                print(f"  ✗ ハッシュ値不一致: {db_path} が作成時から変化しているか、壊れています。")
+                all_ok = False
+                issues.append({
+                    "type": "db_hash_mismatch",
+                    "db_path": db_path,
+                    "actual_hash": actual_db_hash,
+                    "expected_hash": expected_db_hash,
+                })
+
+            for table in ["todos", "replies"]:
+                try:
+                    count = sqlite_adapter.count_table_rows(table)
+                    total_counts[table] += count
+                except Exception as e:
+                    print(f"  ✗ {db_path} の {table} テーブル確認中にエラーです: {e}")
                     all_ok = False
                     issues.append({
-                        "type": "table_count_mismatch",
+                        "type": "table_check_error",
+                        "db_path": db_path,
                         "table": table,
-                        "actual": count,
-                        "expected": expected,
+                        "error": str(e),
                     })
-            except sqlite3.OperationalError:
-                print(f"  ✗ {table} テーブルが存在しません。")
+
+        for table in ["todos", "replies"]:
+            actual_total = total_counts[table]
+            expected = manifest.counts.get(table, 0)
+            if actual_total == expected:
+                print(f"  ✓ {table} 合計: {actual_total} 件（マニフェストと完全に一致）")
+            else:
+                print(f"  ✗ {table} 合計: 件数不一致 (実体:{actual_total}件 vs マニフェスト:{expected}件)")
                 all_ok = False
-                issues.append({"type": "table_missing", "table": table})
-            except Exception as e:
-                print(f"  ✗ {table} テーブル確認中にエラーです: {e}")
-                all_ok = False
-                issues.append({"type": "table_check_error", "table": table, "error": str(e)})
+                issues.append({
+                    "type": "table_count_mismatch",
+                    "table": table,
+                    "actual": actual_total,
+                    "expected": expected,
+                })
 
     print("\n📌 画像ZIPの確認")
     total_img_count = 0
@@ -272,7 +322,7 @@ def verify_backup():
                     event_type="backup_verification_ok",
                     message="バックアップ整合性チェックに成功しました",
                     detail={
-                        "db_path": DB_FILE,
+                        "db_files": db_files,
                         "manifest_path": MANIFEST_FILE,
                         "restore_ok_marker": RESTORE_OK_FILE,
                     },
@@ -306,7 +356,7 @@ def verify_backup():
                 event_type="backup_verification_failed",
                 message="バックアップ整合性チェックに失敗しました",
                 detail={
-                    "db_path": DB_FILE,
+                    "db_files": db_files,
                     "manifest_path": MANIFEST_FILE,
                     "issues": issues,
                 },
